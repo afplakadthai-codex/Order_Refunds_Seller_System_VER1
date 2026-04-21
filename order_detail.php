@@ -554,11 +554,70 @@ if (!function_exists('bv_member_order_detail_can_cancel')) {
         return bv_member_order_detail_request_mode($order) === 'cancel';
     }
 }
-
 if (!function_exists('bv_member_order_detail_can_refund')) {
     function bv_member_order_detail_can_refund(array $order): bool
     {
         return bv_member_order_detail_request_mode($order) === 'refund';
+    }
+}
+
+if (!function_exists('bv_member_order_detail_item_field')) {
+    function bv_member_order_detail_item_field(array $item, array $keys, $default = null)
+    {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $item)) {
+                return $item[$key];
+            }
+        }
+
+        return $default;
+    }
+}
+
+if (!function_exists('bv_member_order_detail_item_qty')) {
+    function bv_member_order_detail_item_qty(array $item): int
+    {
+        $qty = bv_member_order_detail_item_field($item, ['quantity', 'qty', 'item_qty'], 1);
+        if (!is_numeric($qty)) {
+            return 1;
+        }
+
+        $value = (int) $qty;
+        return $value > 0 ? $value : 1;
+    }
+}
+
+if (!function_exists('bv_member_order_detail_item_is_selectable')) {
+    function bv_member_order_detail_item_is_selectable(array $item, string $requestType): bool
+    {
+        $itemStatus = strtolower(trim((string) bv_member_order_detail_item_field($item, ['status', 'item_status', 'order_item_status'], '')));
+        $cancelStatus = strtolower(trim((string) bv_member_order_detail_item_field($item, ['cancel_status', 'cancellation_status'], '')));
+        $refundStatus = strtolower(trim((string) bv_member_order_detail_item_field($item, ['refund_status'], '')));
+        $isCancelled = (int) bv_member_order_detail_item_field($item, ['is_cancelled', 'cancelled'], 0) > 0;
+        $isRefunded = (int) bv_member_order_detail_item_field($item, ['is_refunded', 'refunded'], 0) > 0;
+        $isClosed = (int) bv_member_order_detail_item_field($item, ['is_closed', 'closed'], 0) > 0;
+
+        if ($isCancelled || $isRefunded || $isClosed) {
+            return false;
+        }
+
+        $blocked = ['cancelled', 'canceled', 'refunded', 'closed', 'voided'];
+        if (in_array($itemStatus, $blocked, true) || in_array($cancelStatus, $blocked, true)) {
+            return false;
+        }
+
+        if ($requestType === 'refund') {
+            if (in_array($refundStatus, ['refunded', 'completed', 'closed', 'approved'], true)) {
+                return false;
+            }
+        } else {
+            if (in_array($cancelStatus, ['approved', 'completed'], true)) {
+                return false;
+            }
+        }
+
+        $qty = bv_member_order_detail_item_qty($item);
+        return $qty > 0;
     }
 }
 
@@ -810,7 +869,27 @@ $flashOld = is_array($flash) && isset($flash['old']) && is_array($flash['old']) 
 
 $cancelReasonCodeOld = (string) ($flashOld['reason_code'] ?? 'other');
 $cancelReasonTextOld = (string) ($flashOld['reason_text'] ?? '');
-
+$selectedItemIdsOld = [];
+if (isset($flashOld['selected_item_ids']) && is_array($flashOld['selected_item_ids'])) {
+    foreach ($flashOld['selected_item_ids'] as $oldItemId) {
+        if (is_numeric($oldItemId) && (int) $oldItemId > 0) {
+            $selectedItemIdsOld[(int) $oldItemId] = true;
+        }
+    }
+}
+$selectedQtyOld = isset($flashOld['selected_qty']) && is_array($flashOld['selected_qty']) ? $flashOld['selected_qty'] : [];
+$requestSelectableItems = [];
+foreach ($orderItems as $orderItem) {
+    $itemId = isset($orderItem['id']) && is_numeric($orderItem['id']) ? (int) $orderItem['id'] : 0;
+    if ($itemId <= 0) {
+        continue;
+    }
+    if (!bv_member_order_detail_item_is_selectable($orderItem, $requestType)) {
+        continue;
+    }
+    $requestSelectableItems[] = $orderItem;
+}
+$hasSelectableRequestItems = !empty($requestSelectableItems);
 $cancelCsrfToken = bv_member_order_detail_csrf_token('order_cancel_request');
 $cancelFormStartedAt = bv_member_order_detail_form_started_at('order_cancel_request');
 
@@ -1438,11 +1517,55 @@ if ($shipToDisplay === '') {
                                     </select>
                                 </div>
 
-                                <div class="field">
+                                 <div class="field">
                                     <label for="cancel_reason_text">Tell us why</label>
                                     <textarea name="reason_text" id="cancel_reason_text" placeholder="<?= bv_member_order_detail_h($requestExplainPlaceholder); ?>"><?= bv_member_order_detail_h($cancelReasonTextOld); ?></textarea>
 <?php if (!empty($flashErrors['reason_text'])): ?>
     <div class="error-text"><?= bv_member_order_detail_h((string) $flashErrors['reason_text']); ?></div>
+<?php endif; ?>
+                                </div>
+
+                                <div class="field">
+                                    <label>Select item(s)</label>
+                                    <?php if ($hasSelectableRequestItems): ?>
+                                        <div style="display:flex;flex-direction:column;gap:10px;border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc;">
+                                            <?php foreach ($requestSelectableItems as $reqItem): ?>
+                                                <?php
+                                                $reqItemId = isset($reqItem['id']) && is_numeric($reqItem['id']) ? (int) $reqItem['id'] : 0;
+                                                if ($reqItemId <= 0) {
+                                                    continue;
+                                                }
+                                                $reqQty = bv_member_order_detail_item_qty($reqItem);
+                                                $reqTitle = (string) (($reqItem['listing_title_snapshot'] ?? '') ?: ($reqItem['title'] ?? ($reqItem['item_name'] ?? ('Item #' . $reqItemId))));
+                                                $reqChecked = isset($selectedItemIdsOld[$reqItemId]) || empty($selectedItemIdsOld);
+                                                $oldQtyValue = isset($selectedQtyOld[$reqItemId]) && is_numeric($selectedQtyOld[$reqItemId]) ? (int) $selectedQtyOld[$reqItemId] : $reqQty;
+                                                if ($oldQtyValue <= 0) {
+                                                    $oldQtyValue = 1;
+                                                } elseif ($oldQtyValue > $reqQty) {
+                                                    $oldQtyValue = $reqQty;
+                                                }
+                                                ?>
+                                                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                                                    <label style="display:flex;align-items:center;gap:8px;margin:0;">
+                                                        <input type="checkbox" name="selected_item_ids[]" value="<?= (int) $reqItemId; ?>" <?= $reqChecked ? 'checked' : ''; ?>>
+                                                        <span><?= bv_member_order_detail_h($reqTitle); ?> (Qty: <?= (int) $reqQty; ?>)</span>
+                                                    </label>
+                                                    <?php if ($reqQty > 1): ?>
+                                                        <div style="display:flex;align-items:center;gap:6px;">
+                                                            <span style="font-size:12px;color:#475569;">Request qty</span>
+                                                            <input type="number" name="selected_qty[<?= (int) $reqItemId; ?>]" min="1" max="<?= (int) $reqQty; ?>" value="<?= (int) $oldQtyValue; ?>" style="width:80px;padding:8px;border:1px solid #cbd5e1;border-radius:8px;">
+                                                        </div>
+                                                    <?php else: ?>
+                                                        <input type="hidden" name="selected_qty[<?= (int) $reqItemId; ?>]" value="1">
+                                                    <?php endif; ?>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    <?php else: ?>
+                                        <div class="note">No eligible items are available for this request.</div>
+                                    <?php endif; ?>
+<?php if (!empty($flashErrors['selected_items'])): ?>
+    <div class="error-text"><?= bv_member_order_detail_h((string) $flashErrors['selected_items']); ?></div>
 <?php endif; ?>
                                 </div>
 
@@ -1457,12 +1580,12 @@ if ($shipToDisplay === '') {
 								<div class="error-text" style="margin-bottom:10px;"><?= bv_member_order_detail_h((string) $flashErrors['order_id']); ?></div>
 								<?php endif; ?>
 
-                                <div class="note" style="margin-bottom:14px;">
+   <div class="note" style="margin-bottom:14px;">
                                     <?= bv_member_order_detail_h($requestHelperNote); ?>
                                 </div>
 
                                 <input type="hidden" name="request_type" value="<?= bv_member_order_detail_h($requestType); ?>">
-                                <button class="btn-danger" type="submit"><?= bv_member_order_detail_h($requestButtonLabel); ?></button>
+                                <button class="btn-danger" type="submit" <?= $hasSelectableRequestItems ? '' : 'disabled'; ?>><?= bv_member_order_detail_h($requestButtonLabel); ?></button>
                             </form>
                         <?php endif; ?>
                     </div>
