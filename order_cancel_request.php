@@ -89,6 +89,97 @@ if (!function_exists('bvocr_load_order_items_by_order_id')) {
     }
 }
 
+if (!function_exists('bvocr_item_field')) {
+    function bvocr_item_field(array $item, array $keys, $default = null)
+    {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $item)) {
+                return $item[$key];
+            }
+        }
+
+        return $default;
+    }
+}
+
+if (!function_exists('bvocr_item_qty')) {
+    function bvocr_item_qty(array $item): int
+    {
+        $qty = bvocr_item_field($item, ['quantity', 'qty', 'item_qty'], 1);
+        if (!is_numeric($qty)) {
+            return 1;
+        }
+        $value = (int) $qty;
+        return $value > 0 ? $value : 1;
+    }
+}
+
+if (!function_exists('bvocr_item_selectable')) {
+    function bvocr_item_selectable(array $item, string $requestKind): bool
+    {
+        $itemStatus = strtolower(trim((string) bvocr_item_field($item, ['status', 'item_status', 'order_item_status'], '')));
+        $cancelStatus = strtolower(trim((string) bvocr_item_field($item, ['cancel_status', 'cancellation_status'], '')));
+        $refundStatus = strtolower(trim((string) bvocr_item_field($item, ['refund_status'], '')));
+        $isCancelled = (int) bvocr_item_field($item, ['is_cancelled', 'cancelled'], 0) > 0;
+        $isRefunded = (int) bvocr_item_field($item, ['is_refunded', 'refunded'], 0) > 0;
+        $isClosed = (int) bvocr_item_field($item, ['is_closed', 'closed'], 0) > 0;
+
+        if ($isCancelled || $isRefunded || $isClosed) {
+            return false;
+        }
+
+        $blocked = ['cancelled', 'canceled', 'refunded', 'closed', 'voided'];
+        if (in_array($itemStatus, $blocked, true) || in_array($cancelStatus, $blocked, true)) {
+            return false;
+        }
+
+        if ($requestKind === 'refund' && in_array($refundStatus, ['refunded', 'completed', 'closed', 'approved'], true)) {
+            return false;
+        }
+
+        return bvocr_item_qty($item) > 0;
+    }
+}
+
+if (!function_exists('bvocr_selected_items_from_post')) {
+    function bvocr_selected_items_from_post(): array
+    {
+        $idsRaw = $_POST['selected_item_ids'] ?? [];
+        $qtyRaw = $_POST['selected_qty'] ?? [];
+        $selected = [];
+
+        if (!is_array($idsRaw)) {
+            return [];
+        }
+
+        foreach ($idsRaw as $rawId) {
+            if (!is_numeric($rawId)) {
+                continue;
+            }
+
+            $itemId = (int) $rawId;
+            if ($itemId <= 0) {
+                continue;
+            }
+
+            $qty = 1;
+            if (is_array($qtyRaw) && array_key_exists((string) $itemId, $qtyRaw) && is_numeric($qtyRaw[(string) $itemId])) {
+                $qty = (int) $qtyRaw[(string) $itemId];
+            } elseif (is_array($qtyRaw) && array_key_exists($itemId, $qtyRaw) && is_numeric($qtyRaw[$itemId])) {
+                $qty = (int) $qtyRaw[$itemId];
+            }
+
+            if ($qty <= 0) {
+                $qty = 1;
+            }
+
+            $selected[$itemId] = $qty;
+        }
+
+        return $selected;
+    }
+}
+
 if (!function_exists('bvocr_cancellation_items_exist')) {
     function bvocr_cancellation_items_exist(int $cancellationId, ?PDO $pdo = null): bool
     {
@@ -205,6 +296,138 @@ $columns = bvocr_pdo_table_columns($pdo, 'order_cancellation_items');
         }
 
         return $inserted;
+    }
+}
+
+if (!function_exists('bvocr_insert_cancellation_items_from_selected')) {
+    function bvocr_insert_cancellation_items_from_selected(int $orderId, int $cancellationId, array $selectedItems, string $requestKind = 'cancel', ?PDO $pdo = null): array
+    {
+        $pdo = $pdo ?: bvocr_pdo_db();
+        $result = [
+            'inserted' => 0,
+            'cancellation_item_ids' => [],
+            'requested_total' => 0.0,
+        ];
+
+        if ($orderId <= 0 || $cancellationId <= 0 || empty($selectedItems)) {
+            return $result;
+        }
+
+        $ids = array_keys($selectedItems);
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        $ids = array_values(array_filter($ids, static function ($v) {
+            return $v > 0;
+        }));
+        if (empty($ids)) {
+            return $result;
+        }
+
+        $in = implode(', ', array_fill(0, count($ids), '?'));
+        $params = array_merge([$orderId], $ids);
+        $stmt = $pdo->prepare('SELECT * FROM order_items WHERE order_id = ? AND id IN (' . $in . ') ORDER BY id ASC');
+        $stmt->execute($params);
+        $items = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+        $columns = bvocr_pdo_table_columns($pdo, 'order_cancellation_items');
+        if (empty($columns)) {
+            return $result;
+        }
+
+        foreach ($items as $item) {
+            $itemId = isset($item['id']) && is_numeric($item['id']) ? (int) $item['id'] : 0;
+            if ($itemId <= 0 || !isset($selectedItems[$itemId])) {
+                continue;
+            }
+            if (!bvocr_item_selectable($item, $requestKind)) {
+                continue;
+            }
+
+            $orderQty = bvocr_item_qty($item);
+            $reqQty = (int) $selectedItems[$itemId];
+            if ($reqQty <= 0) {
+                $reqQty = 1;
+            }
+            if ($reqQty > $orderQty) {
+                $reqQty = $orderQty;
+            }
+
+            $unitPrice = 0.0;
+            foreach (['unit_price', 'price', 'item_price'] as $priceKey) {
+                if (isset($item[$priceKey]) && $item[$priceKey] !== '' && is_numeric($item[$priceKey])) {
+                    $unitPrice = (float) $item[$priceKey];
+                    break;
+                }
+            }
+
+            $lineTotal = null;
+            foreach (['line_total', 'total', 'amount_total'] as $totalKey) {
+                if (isset($item[$totalKey]) && $item[$totalKey] !== '' && is_numeric($item[$totalKey])) {
+                    $lineTotal = (float) $item[$totalKey];
+                    break;
+                }
+            }
+            if ($lineTotal === null) {
+                $lineTotal = (float) $orderQty * $unitPrice;
+            }
+
+            $effectiveLineTotal = $orderQty > 0
+                ? round(((float) $lineTotal / (float) $orderQty) * (float) $reqQty, 2)
+                : round((float) $reqQty * $unitPrice, 2);
+
+            $listingTitle = '';
+            foreach (['listing_title_snapshot', 'title', 'item_name', 'name', 'product_name'] as $titleKey) {
+                if (isset($item[$titleKey]) && (string) $item[$titleKey] !== '') {
+                    $listingTitle = (string) $item[$titleKey];
+                    break;
+                }
+            }
+
+            $payload = [
+                'cancellation_id' => $cancellationId,
+                'order_id' => $orderId,
+                'order_item_id' => $itemId,
+                'listing_id' => isset($item['listing_id']) ? (int) $item['listing_id'] : null,
+                'seller_user_id' => isset($item['seller_user_id']) ? (int) $item['seller_user_id'] : null,
+                'qty' => $orderQty,
+                'refund_qty' => $reqQty,
+                'unit_price_snapshot' => round($unitPrice, 2),
+                'line_total_snapshot' => round($effectiveLineTotal, 2),
+                'listing_title_snapshot' => $listingTitle,
+                'restock_qty' => $reqQty,
+                'stock_reversed' => 0,
+                'stock_reversed_at' => null,
+                'stock_reverse_note' => '',
+                'item_refundable_amount' => round($effectiveLineTotal, 2),
+                'refund_line_amount' => round($effectiveLineTotal, 2),
+            ];
+
+            $keys = [];
+            $values = [];
+            $insertParams = [];
+            foreach ($payload as $field => $value) {
+                if (!isset($columns[$field])) {
+                    continue;
+                }
+                $keys[] = "`{$field}`";
+                $values[] = ':' . $field;
+                $insertParams[$field] = $value;
+            }
+            if (empty($keys)) {
+                continue;
+            }
+
+            $insertSql = 'INSERT INTO order_cancellation_items (' . implode(', ', $keys) . ') VALUES (' . implode(', ', $values) . ')';
+            $insertStmt = $pdo->prepare($insertSql);
+            $insertStmt->execute($insertParams);
+            $insertedId = (int) $pdo->lastInsertId();
+            if ($insertedId > 0) {
+                $result['inserted']++;
+                $result['cancellation_item_ids'][] = $insertedId;
+                $result['requested_total'] = round((float) $result['requested_total'] + (float) $effectiveLineTotal, 2);
+            }
+        }
+
+        return $result;
     }
 }
 
@@ -1291,9 +1514,12 @@ if (!function_exists('bvocr_message_label')) {
                 ? 'This order cannot be refunded from your account at the moment.'
                 : 'This order cannot be cancelled from your account at the moment.',
             'not_found' => 'Order not found.',
-            'invalid' => $requestKind === 'refund'
+           'invalid' => $requestKind === 'refund'
                 ? 'Invalid refund request.'
                 : 'Invalid cancellation request.',
+            'selected_items_required' => $requestKind === 'refund'
+                ? 'Please select at least one eligible item to refund.'
+                : 'Please select at least one eligible item.',
             'back_order' => 'Back to Order',
             'request_label' => $requestLabelUc,
         ];
@@ -1328,6 +1554,8 @@ $old = [
     'reason_code' => (string) ($_POST['reason_code'] ?? ($_POST['cancel_reason_code'] ?? ($_POST['refund_reason_code'] ?? ''))),
     'reason_text' => (string) ($_POST['reason_text'] ?? ($_POST['cancel_reason_text'] ?? ($_POST['refund_reason_text'] ?? ''))),
     'return_url' => (string) ($_POST['return_url'] ?? ''),
+    'selected_item_ids' => array_values(array_filter(array_map('intval', is_array($_POST['selected_item_ids'] ?? null) ? $_POST['selected_item_ids'] : []))),
+    'selected_qty' => is_array($_POST['selected_qty'] ?? null) ? $_POST['selected_qty'] : [],
 ];
 
 if (!bvoc_require_tables()) {
@@ -1400,6 +1628,8 @@ if (bvocr_is_too_fast($startedAt, 2, $scopes)) {
 
 $reasonCode = bvocr_reason_code_from_post();
 $reasonText = bvocr_reason_text_from_post();
+$selectedItemsMap = bvocr_selected_items_from_post();
+$hasSelectedItems = !empty($selectedItemsMap);
 
 $errors = [];
 if ($orderId <= 0) {
@@ -1434,6 +1664,21 @@ try {
     $refundId = 0;
 
   if ($requestKind === 'refund') {
+        if (!$order) {
+            throw new RuntimeException('Order not found.');
+        }
+
+        if (!$hasSelectedItems) {
+            bvocr_flash_redirect(
+                $requestKind,
+                $returnUrl,
+                'invalid',
+                bvocr_message_label($requestKind, 'selected_items_required'),
+                $old,
+                ['selected_items' => bvocr_message_label($requestKind, 'selected_items_required')]
+            );
+        }
+
         $existingCancellation = bvocr_cancellation_find_by_order_id($orderId);
         if ($existingCancellation && isset($existingCancellation['id']) && is_numeric($existingCancellation['id'])) {
             $cancellationId = (int) $existingCancellation['id'];
@@ -1469,11 +1714,29 @@ try {
             }
         }
 
+         $selectedCreation = ['inserted' => 0, 'cancellation_item_ids' => [], 'requested_total' => 0.0];
         if ($cancellationId > 0) {
-            bvocr_ensure_cancellation_items_for_refund_bridge($orderId, $cancellationId);
+            if ($hasSelectedItems) {
+                $selectedCreation = bvocr_insert_cancellation_items_from_selected($orderId, $cancellationId, $selectedItemsMap, 'refund');
+            } else {
+                bvocr_ensure_cancellation_items_for_refund_bridge($orderId, $cancellationId);
+            }
         }
 
-        $requestedAmount = $order ? bvocr_order_total($order) : 0.0;
+        if ($hasSelectedItems && empty($selectedCreation['cancellation_item_ids'])) {
+            bvocr_flash_redirect(
+                $requestKind,
+                $returnUrl,
+                'invalid',
+                bvocr_message_label($requestKind, 'selected_items_required'),
+                $old,
+                ['selected_items' => bvocr_message_label($requestKind, 'selected_items_required')]
+            );
+        }
+
+        $requestedAmount = $hasSelectedItems
+            ? (float) ($selectedCreation['requested_total'] ?? 0.0)
+            : ($order ? bvocr_order_total($order) : 0.0);
         $refundPayload = [
             'order_id' => $orderId,
             'order_cancellation_id' => $cancellationId > 0 ? $cancellationId : 0,
@@ -1483,11 +1746,12 @@ try {
             'actor_role' => $currentRole,
             'refund_source' => bvocr_refund_source($currentRole),
             'refund_reason_code' => $reasonCode,
-            'refund_reason_text' => $reasonText,
+           'refund_reason_text' => $reasonText,
             'requested_refund_amount' => $requestedAmount,
+            'selected_cancellation_item_ids' => $hasSelectedItems ? (array) ($selectedCreation['cancellation_item_ids'] ?? []) : [],
             'admin_note' => '',
             'internal_note' => 'Created from order_cancel_request.php with request_kind=refund',
-        ];
+        ];  
 
         $result = bvocr_refund_create_request($refundPayload);
         $refundId = bvocr_refund_result_id($result);
@@ -1520,18 +1784,43 @@ try {
         bvocr_clear_started_at($scopes);
         bvocr_redirect($nextUrl);
     }
+   if ($hasSelectedItems) {
+        if (!$order) {
+            throw new RuntimeException('Order not found.');
+        }
 
-    $result = bv_order_cancel_create_request([
-        'order_id' => $orderId,
-        'actor_user_id' => $currentUserId,
-        'actor_role' => $currentRole,
-        'cancel_source' => bvocr_cancel_source($currentRole),
-        'cancel_reason_code' => $reasonCode,
-        'cancel_reason_text' => $reasonText,
-        'admin_note' => '',
-    ]);
+        $cancellationId = bvocr_create_refund_bridge_cancellation(
+            $order,
+            $orderId,
+            $currentUserId,
+            $currentRole,
+            $reasonCode,
+            $reasonText
+        );
+        $selectedCancelCreation = bvocr_insert_cancellation_items_from_selected($orderId, $cancellationId, $selectedItemsMap, 'cancel');
+        if (empty($selectedCancelCreation['cancellation_item_ids'])) {
+            bvocr_flash_redirect(
+                $requestKind,
+                $returnUrl,
+                'invalid',
+                bvocr_message_label($requestKind, 'selected_items_required'),
+                $old,
+                ['selected_items' => bvocr_message_label($requestKind, 'selected_items_required')]
+            );
+        }
+    } else {
+        $result = bv_order_cancel_create_request([
+            'order_id' => $orderId,
+            'actor_user_id' => $currentUserId,
+            'actor_role' => $currentRole,
+            'cancel_source' => bvocr_cancel_source($currentRole),
+            'cancel_reason_code' => $reasonCode,
+            'cancel_reason_text' => $reasonText,
+            'admin_note' => '',
+        ]);
 
-    $cancellationId = (int) ($result['cancellation_id'] ?? 0);
+        $cancellationId = (int) ($result['cancellation_id'] ?? 0);
+    }
     $nextUrl = bvocr_build_url($returnUrl, [
         'cancel' => 'requested',
         'cancellation_id' => $cancellationId > 0 ? $cancellationId : null,
